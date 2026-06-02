@@ -1,15 +1,30 @@
 import os
+from collections.abc import Callable
+from typing import Any, TypeVar
+
 from fastapi import APIRouter, HTTPException
+from google.adk.tools import FunctionTool
 from pydantic import BaseModel
 from database import list_devices, update_device_status, save_chat_messages
 
 router = APIRouter()
+ToolFunc = TypeVar("ToolFunc", bound=Callable[..., Any])
+
+
+def adk_tool(func: ToolFunc) -> ToolFunc:
+    setattr(func, "_adk_tool", FunctionTool(func))
+    return func
+
+
+def _as_adk_tool(func: Callable[..., Any]) -> FunctionTool:
+    return getattr(func, "_adk_tool")
 
 
 class AgentRequest(BaseModel):
     message: str
 
 
+@adk_tool
 def get_device_status(device_id: int) -> dict:
     """Returns the current on/off status of a device by its ID.
 
@@ -30,6 +45,7 @@ def get_device_status(device_id: int) -> dict:
         return {"error": f"Database error: {str(e)}"}
 
 
+@adk_tool
 def toggle_device(device_id: int, state: bool) -> dict:
     """Turns a smart home device on or off.
 
@@ -56,7 +72,7 @@ def toggle_device(device_id: int, state: bool) -> dict:
         return {"error": f"Database error: {str(e)}"}
 
 
-def _build_agent():
+def _build_agent() -> Any:
     from google.adk.agents import Agent
     from database import get_user_profile
     profile = get_user_profile()
@@ -89,13 +105,14 @@ Rules:
 5. If device not found, list available devices.
 6. Be concise, friendly, and helpful.
 """,
-        tools=[get_device_status, toggle_device],
+        tools=[_as_adk_tool(get_device_status), _as_adk_tool(toggle_device)],
     )
 
 
-_session_service = None
+_session_service: Any | None = None
 
-def _get_session_service():
+
+def _get_session_service() -> Any:
     global _session_service
     if _session_service is None:
         from google.adk.sessions import InMemorySessionService
@@ -134,7 +151,7 @@ async def _run_agent(message: str) -> str:
 
 
 @router.post("/agent")
-async def agent_chat(req: AgentRequest):
+async def agent_chat(req: AgentRequest) -> dict[str, str]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured")
