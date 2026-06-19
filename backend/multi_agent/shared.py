@@ -1,13 +1,11 @@
-import os
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from dotenv import load_dotenv
 from google.adk.tools import FunctionTool
 
-load_dotenv()
+from config import VERTEX_AI_MODEL
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = VERTEX_AI_MODEL
 ToolFunc = TypeVar("ToolFunc", bound=Callable[..., Any])
 
 

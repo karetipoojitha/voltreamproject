@@ -3,5 +3,6 @@ uvicorn[standard]
 pydantic
 python-dotenv
 google-adk
-google-generativeai
-hypothesis
+chromadb
+sentence-transformers
+pypdf

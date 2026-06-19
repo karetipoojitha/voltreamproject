@@ -1,160 +1,138 @@
-import os
 from collections.abc import Callable
 from typing import Any, TypeVar
 
 from fastapi import APIRouter, HTTPException
-from google.adk.tools import FunctionTool
 from pydantic import BaseModel
-from database import list_devices, update_device_status, save_chat_messages
+from config import VERTEX_AI_MODEL
+from database import list_devices, update_device_status, save_chat_messages, find_device_by_name
 
 router = APIRouter()
-ToolFunc = TypeVar("ToolFunc", bound=Callable[..., Any])
-
-
-def adk_tool(func: ToolFunc) -> ToolFunc:
-    setattr(func, "_adk_tool", FunctionTool(func))
-    return func
-
-
-def _as_adk_tool(func: Callable[..., Any]) -> FunctionTool:
-    return getattr(func, "_adk_tool")
-
 
 class AgentRequest(BaseModel):
     message: str
 
 
-@adk_tool
-def get_device_status(device_id: int) -> dict:
-    """Returns the current on/off status of a device by its ID.
+ON_WORDS  = ["turn on", "switch on", "enable", "start", "activate", "power on"]
+OFF_WORDS = ["turn off", "switch off", "disable", "stop", "deactivate", "power off"]
 
-    Args:
-        device_id: The integer ID of the device to check.
 
-    Returns:
-        A dict with id, name, and status fields, or an error dict.
+def _parse_device_command(message: str):
     """
-    try:
-        devices = list_devices()
-        for device in devices:
-            if device["id"] == device_id:
-                return {"id": device["id"], "name": device["name"], "status": device["status"]}
-        names = [f"id={d['id']} name='{d['name']}'" for d in devices]
-        return {"error": f"Device with id {device_id} not found. Available: {names}"}
-    except Exception as e:
-        return {"error": f"Database error: {str(e)}"}
-
-
-@adk_tool
-def toggle_device(device_id: int, state: bool) -> dict:
-    """Turns a smart home device on or off.
-
-    Args:
-        device_id: The integer ID of the device to control.
-        state: True to turn the device ON, False to turn it OFF.
-
-    Returns:
-        A dict with id, name, and updated status, or an error dict.
+    Returns (device_id, device_name, state) or None if not a device command.
+    state: True = ON, False = OFF
     """
+    lowered = message.lower().strip()
+
+    state = None
+    for w in ON_WORDS:
+        if w in lowered:
+            state = True
+            break
+    if state is None:
+        for w in OFF_WORDS:
+            if w in lowered:
+                state = False
+                break
+    if state is None:
+        return None
+
+    match = find_device_by_name(message)
+    if match:
+        device_id, device_name = match
+        return device_id, device_name, state
+
+    return None
+
+
+def _handle_device_command(message: str) -> str | None:
+    """Handle device command directly without ADK agent. Returns reply or None."""
+    parsed = _parse_device_command(message)
+    if parsed is None:
+        return None
+
+    device_id, device_name, state = parsed
+    success = update_device_status(device_id, state)
+    if not success:
+        return f"Sorry, I couldn't find {device_name} in the system."
+
+    state_word = "ON" if state else "OFF"
+    return f"Done! {device_name} is now {state_word}."
+
+
+async def _run_agent_llm(message: str) -> str:
+    """Fall back to ADK agent for non-device queries."""
     try:
-        success = update_device_status(device_id, state)
-        if not success:
-            devices = list_devices()
-            names = [f"id={d['id']} name='{d['name']}'" for d in devices]
-            return {"error": f"Device with id {device_id} not found. Available: {names}"}
-        # fetch updated record
-        devices = list_devices()
-        for d in devices:
-            if d["id"] == device_id:
-                return {"id": d["id"], "name": d["name"], "status": d["status"]}
-        return {"error": "Device updated but could not retrieve record."}
-    except Exception as e:
-        return {"error": f"Database error: {str(e)}"}
-
-
-def _build_agent() -> Any:
-    from google.adk.agents import Agent
-    from database import get_user_profile
-    profile = get_user_profile()
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    return Agent(
-        name="voltstream_device_agent",
-        model=model,
-        description="Controls VoltStream smart home devices via natural language.",
-        instruction=f"""You are a personal smart home assistant for VoltStream.
-You help the user, {profile['name']}, control their home devices using natural language.
-
-Personal context for {profile['name']}:
-- Budget Goal: ${profile['budget_goal']}
-- Primary Goal: {profile['primary_goal']}
-- Daily Schedule: {profile['daily_schedule']}
-
-Available devices:
-- id=1  Air Conditioning  (also: AC, air con, air conditioning)
-- id=2  Fan
-- id=3  Washing Machine  (also: washer)
-- id=4  Living Room Lights  (also: lights)
-- id=5  Kitchen TV  (also: TV, television)
-- id=6  Garage Door  (also: garage)
-
-Rules:
-1. To turn on/off a device, call toggle_device with the correct device_id and state (True=on, False=off).
-2. To check device status, call get_device_status.
-3. Resolve names case-insensitively. AC/air con = id=1, lights = id=4, TV = id=5, garage = id=6.
-4. After toggling, confirm the action and new state. Address {profile['name']} by name if natural.
-5. If device not found, list available devices.
-6. Be concise, friendly, and helpful.
-""",
-        tools=[_as_adk_tool(get_device_status), _as_adk_tool(toggle_device)],
-    )
-
-
-_session_service: Any | None = None
-
-
-def _get_session_service() -> Any:
-    global _session_service
-    if _session_service is None:
+        from google.adk.agents import Agent
+        from google.adk.tools import FunctionTool
+        from google.adk.runners import Runner
         from google.adk.sessions import InMemorySessionService
-        _session_service = InMemorySessionService()
-    return _session_service
+        from google.genai import types
+        from database import get_user_profile
 
+        profile = get_user_profile()
+        devices = list_devices()
+        device_list = "\n".join(
+            f"- {d['name']}: {'ON' if d['status'] else 'OFF'}" for d in devices
+        )
 
-async def _run_agent(message: str) -> str:
-    from google.adk.runners import Runner
-    from google.genai import types
+        def get_all_device_status() -> dict:
+            """Returns the current status of all smart home devices."""
+            return {"devices": list_devices()}
 
-    agent = _build_agent()
-    session_service = _get_session_service()
-    existing = await session_service.get_session(
-        app_name="voltstream",
-        user_id="user",
-        session_id="session-1",
-    )
-    if not existing:
+        agent = Agent(
+            name="voltstream_assistant",
+            model=VERTEX_AI_MODEL,
+            description="VoltStream smart home assistant.",
+            instruction=f"""You are VoltStream AI assistant for {profile['name']}.
+Current device status:
+{device_list}
+
+Answer questions about devices, energy usage, or home automation.
+Be concise and friendly.
+""",
+            tools=[FunctionTool(get_all_device_status)],
+        )
+
+        session_service = InMemorySessionService()
         await session_service.create_session(
             app_name="voltstream",
             user_id="user",
             session_id="session-1",
         )
-    runner = Runner(agent=agent, app_name="voltstream", session_service=session_service)
-    user_message = types.Content(role="user", parts=[types.Part(text=message)])
+        runner = Runner(
+            agent=agent,
+            app_name="voltstream",
+            session_service=session_service,
+        )
+        user_message = types.Content(role="user", parts=[types.Part(text=message)])
 
-    final_reply = ""
-    async for event in runner.run_async(user_id="user", session_id="session-1", new_message=user_message):
-        if event.is_final_response():
-            if event.content and event.content.parts:
-                final_reply = event.content.parts[0].text
-            break
+        final_reply = ""
+        async for event in runner.run_async(
+            user_id="user", session_id="session-1", new_message=user_message
+        ):
+            if event.is_final_response():
+                if event.content and event.content.parts:
+                    final_reply = event.content.parts[0].text
+                break
 
-    return final_reply or "I could not process your request. Please try again."
+        return final_reply or "I could not process your request. Please try again."
+
+    except Exception as e:
+        return f"Assistant error: {str(e)}"
+
+
+async def _run_agent(message: str) -> str:
+    # 1. Try direct device command first — fast and reliable
+    direct = _handle_device_command(message)
+    if direct is not None:
+        return direct
+
+    # 2. Fall back to LLM agent for everything else
+    return await _run_agent_llm(message)
 
 
 @router.post("/agent")
 async def agent_chat(req: AgentRequest) -> dict[str, str]:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured")
     reply = ""
     try:
         reply = await _run_agent(req.message)

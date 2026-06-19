@@ -17,7 +17,7 @@ def _utc_now_iso() -> str:
 
 @contextmanager
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -128,79 +128,94 @@ def _ensure_washing_machine_device() -> None:
 def _seed_if_empty() -> None:
     with get_connection() as conn:
         cur = conn.cursor()
+        
+        # Seed dashboard_metrics
+        cur.execute("SELECT COUNT(*) AS c FROM dashboard_metrics")
+        if cur.fetchone()["c"] == 0:
+            now = _utc_now_iso()
+            cur.execute(
+                """INSERT OR REPLACE INTO dashboard_metrics
+                   (id, grid_power, solar_generation, net_consumption, updated_at)
+                   VALUES (1, 4.2, 8.5, 2.1, ?)""",
+                (now,),
+            )
+
+        # Seed devices
         cur.execute("SELECT COUNT(*) AS c FROM devices")
-        if cur.fetchone()["c"] > 0:
-            return
+        if cur.fetchone()["c"] == 0:
+            for name, status in [
+                ("Living Room Lights", True),
+                ("Kitchen TV", False),
+                ("Master Bedroom AC", True),
+                ("Garage Door", True),
+                ("Washing Machine", True),
+            ]:
+                cur.execute(
+                    "INSERT INTO devices (name, status) VALUES (?, ?)",
+                    (name, 1 if status else 0),
+                )
 
-        now = _utc_now_iso()
-        cur.execute(
-            """INSERT OR REPLACE INTO dashboard_metrics
-               (id, grid_power, solar_generation, net_consumption, updated_at)
-               VALUES (1, 4.2, 8.5, 2.1, ?)""",
-            (now,),
-        )
-
-        for name, status in [
-            ("Living Room Lights", True),
-            ("Kitchen TV", False),
-            ("Master Bedroom AC", True),
-            ("Garage Door", True),
-            ("Washing Machine", True),
-        ]:
+        # Seed billing_summary
+        cur.execute("SELECT COUNT(*) AS c FROM billing_summary")
+        if cur.fetchone()["c"] == 0:
             cur.execute(
-                "INSERT INTO devices (name, status) VALUES (?, ?)",
-                (name, 1 if status else 0),
+                """INSERT OR REPLACE INTO billing_summary
+                   (id, current_bill, projected_bill, budget_alert)
+                   VALUES (1, 1800, 1950, 'You are at 78% of your monthly energy budget.')"""
             )
 
-        cur.execute(
-            """INSERT OR REPLACE INTO billing_summary
-               (id, current_bill, projected_bill, budget_alert)
-               VALUES (1, 1800, 1950, 'You are at 78% of your monthly energy budget.')"""
-        )
+        # Seed billing_history
+        cur.execute("SELECT COUNT(*) AS c FROM billing_history")
+        if cur.fetchone()["c"] == 0:
+            history = [
+                ("Jan", 1200, 1),
+                ("Feb", 1100, 2),
+                ("Mar", 1400, 3),
+                ("Apr", 1350, 4),
+                ("May", 1800, 5),
+                ("Jun", 1600, 6),
+            ]
+            for month, amount, order in history:
+                cur.execute(
+                    "INSERT INTO billing_history (month, amount, sort_order) VALUES (?, ?, ?)",
+                    (month, amount, order),
+                )
 
-        history = [
-            ("Jan", 1200, 1),
-            ("Feb", 1100, 2),
-            ("Mar", 1400, 3),
-            ("Apr", 1350, 4),
-            ("May", 1800, 5),
-            ("Jun", 1600, 6),
-        ]
-        for month, amount, order in history:
-            cur.execute(
-                "INSERT INTO billing_history (month, amount, sort_order) VALUES (?, ?, ?)",
-                (month, amount, order),
-            )
+        # Seed billing_transactions
+        cur.execute("SELECT COUNT(*) AS c FROM billing_transactions")
+        if cur.fetchone()["c"] == 0:
+            transactions = [
+                ("INV-2026-05", "May 01, 2026", 1800, "Pending"),
+                ("INV-2026-04", "Apr 01, 2026", 1350, "Paid"),
+                ("INV-2026-03", "Mar 01, 2026", 1400, "Paid"),
+                ("INV-2026-02", "Feb 01, 2026", 1100, "Paid"),
+                ("INV-2026-01", "Jan 01, 2026", 1200, "Paid"),
+                ("INV-2025-12", "Dec 01, 2025", 1550, "Paid"),
+            ]
+            for inv, dlabel, amt, st in transactions:
+                cur.execute(
+                    """INSERT OR IGNORE INTO billing_transactions (invoice_id, date_label, amount, status)
+                       VALUES (?, ?, ?, ?)""",
+                    (inv, dlabel, amt, st),
+                )
 
-        transactions = [
-            ("INV-2026-05", "May 01, 2026", 1800, "Pending"),
-            ("INV-2026-04", "Apr 01, 2026", 1350, "Paid"),
-            ("INV-2026-03", "Mar 01, 2026", 1400, "Paid"),
-            ("INV-2026-02", "Feb 01, 2026", 1100, "Paid"),
-            ("INV-2026-01", "Jan 01, 2026", 1200, "Paid"),
-            ("INV-2025-12", "Dec 01, 2025", 1550, "Paid"),
-        ]
-        for inv, dlabel, amt, st in transactions:
-            cur.execute(
-                """INSERT INTO billing_transactions (invoice_id, date_label, amount, status)
-                   VALUES (?, ?, ?, ?)""",
-                (inv, dlabel, amt, st),
-            )
-
-        daily = [
-            ("Mon", 12.4, 1),
-            ("Tue", 15.1, 2),
-            ("Wed", 11.8, 3),
-            ("Thu", 14.2, 4),
-            ("Fri", 18.6, 5),
-            ("Sat", 16.3, 6),
-            ("Sun", 13.0, 7),
-        ]
-        for day, usage, order in daily:
-            cur.execute(
-                "INSERT INTO analytics_daily (day_name, usage_kwh, sort_order) VALUES (?, ?, ?)",
-                (day, usage, order),
-            )
+        # Seed analytics_daily
+        cur.execute("SELECT COUNT(*) AS c FROM analytics_daily")
+        if cur.fetchone()["c"] == 0:
+            daily = [
+                ("Mon", 12.4, 1),
+                ("Tue", 15.1, 2),
+                ("Wed", 11.8, 3),
+                ("Thu", 14.2, 4),
+                ("Fri", 18.6, 5),
+                ("Sat", 16.3, 6),
+                ("Sun", 13.0, 7),
+            ]
+            for day, usage, order in daily:
+                cur.execute(
+                    "INSERT INTO analytics_daily (day_name, usage_kwh, sort_order) VALUES (?, ?, ?)",
+                    (day, usage, order),
+                )
 
 
 def get_dashboard() -> dict[str, Any]:
@@ -339,3 +354,52 @@ def update_user_profile(profile: dict[str, Any]) -> dict[str, Any]:
             ),
         )
     return get_user_profile()
+
+
+def find_device_by_name(message: str) -> Optional[tuple[int, str]]:
+    """Dynamically find a device's ID and name from the database based on message text."""
+    lowered = message.lower().strip()
+    devices = list_devices()  # Returns list of dicts: {"id": int, "name": str, "status": bool}
+
+    # Define synonyms mapping to search keywords
+    synonyms = {
+        "ac": ["air conditioning", "air conditioner", "ac", "a/c", "master bedroom ac"],
+        "fan": ["fan"],
+        "washing machine": ["washing machine", "washer", "washing"],
+        "living room lights": ["living room lights", "living room light", "lights", "light"],
+        "kitchen tv": ["kitchen tv", "tv", "television"],
+        "garage door": ["garage door", "garage"]
+    }
+
+    # Sort synonyms by length of search term in descending order to match longest first
+    all_terms = []
+    for canonical, terms in synonyms.items():
+        for term in terms:
+            all_terms.append((term, canonical))
+    all_terms.sort(key=lambda x: len(x[0]), reverse=True)
+
+    matched_canonical = None
+    for term, canonical in all_terms:
+        if term in lowered:
+            matched_canonical = canonical
+            break
+
+    if not matched_canonical:
+        return None
+
+    # Map matched_canonical to search keywords to find the device in the database list
+    search_keywords = {
+        "ac": ["ac", "air condition", "aircon"],
+        "fan": ["fan"],
+        "washing machine": ["washing", "washer"],
+        "living room lights": ["light"],
+        "kitchen tv": ["tv", "television"],
+        "garage door": ["garage"]
+    }.get(matched_canonical, [matched_canonical])
+
+    for d in devices:
+        d_name_lower = d["name"].lower()
+        if any(kw in d_name_lower for kw in search_keywords):
+            return d["id"], d["name"]
+
+    return None

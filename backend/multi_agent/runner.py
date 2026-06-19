@@ -2,7 +2,6 @@ import logging
 from datetime import datetime
 from typing import TypedDict
 
-from dotenv import load_dotenv
 from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -10,8 +9,6 @@ from google.genai import types
 
 from .agents import analyst_agent, billing_agent, orchestrator_agent
 from .prompts import billing_status_prompt, device_status_prompt
-
-load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("voltstream.multi_agent")
@@ -40,7 +37,7 @@ def _short_trace(text: str) -> str:
 def _is_combined_bill_device_request(message: str) -> bool:
     text = message.lower()
     bill_terms = ("bill", "billing", "cost", "charge", "payment")
-    device_terms = ("device", "devices", "appliance", "appliances")
+    device_terms = ("device", "devices", "divice", "divices", "appliance", "appliances")
     return any(term in text for term in bill_terms) and any(term in text for term in device_terms)
 
 
@@ -96,6 +93,10 @@ async def run_multi_agent(message: str) -> MultiAgentResult:
 
         if not reply and agent_name == "Billing":
             reply = _fallback_billing_reply()
+        if not reply and agent_name == "Analyst":
+            from database import list_devices
+            devices = list_devices()
+            reply = "\n".join(f"- {d['name']}: {'ON' if d['status'] else 'OFF'}" for d in devices)
 
         trace.append({
             "agent": agent_name,
@@ -172,7 +173,10 @@ async def run_multi_agent(message: str) -> MultiAgentResult:
     trace.append({"agent": "Orchestrator", "step": "RESPOND", "msg": "Final response delivered to user", "time": _trace_time()})
     logger.info("[Orchestrator] Final response ready")
 
+    if not final_reply:
+        final_reply = "Mock Mode: Vertex AI returned no final response. Check the trace/logs for auth, model, or routing errors."
+
     return {
-        "reply": final_reply or "I could not generate a response. Please try again.",
+        "reply": final_reply,
         "trace": trace,
     }

@@ -2,176 +2,229 @@ import os
 from dotenv import load_dotenv
 
 import chromadb
-from sentence_transformers import SentenceTransformer
+from google import genai
+
+from config import VERTEX_AI_MODEL
 from pdf_loader import load_pdf
 
-import google.generativeai as genai
 
-
-# ENV
+# ----------------------------
+# CONFIG
+# ----------------------------
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-API_KEY = os.getenv("GEMINI_API_KEY")
-
-# INIT MODELS
-
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
-genai.configure(api_key=API_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash")
-
-# CHROMA DB
-
-client = chromadb.PersistentClient(path=os.path.join(BASE_DIR, "vector_db"))
-collection = client.get_or_create_collection("energy_docs")
-
 PDF_PATH = os.path.join(BASE_DIR, "data", "energy.pdf")
 
-# BUILD VECTOR DB
+# Lazy-loaded — only initialised when first needed, not on import
+_embedder = None
+_vertex_client = None
+
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        from sentence_transformers import SentenceTransformer
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    return _embedder
+
+def get_vertex_client():
+    global _vertex_client
+    if _vertex_client is None:
+        _vertex_client = genai.Client()
+    return _vertex_client
+
+# Keep module-level name for backward compat (used in main.py imports)
+@property
+def embedder():
+    return get_embedder()
+
+client = chromadb.PersistentClient(
+    path=os.path.join(BASE_DIR, "vector_db")
+)
+
+collection = client.get_or_create_collection("energy_docs")
+
+
+# ----------------------------
+# UTIL: detect history question
+# ----------------------------
+
+def is_history_question(q: str) -> bool:
+    q = q.lower()
+    keywords = [
+        "history", "timeline", "evolution",
+        "development", "how did", "journey"
+    ]
+    return any(k in q for k in keywords)
+
+
+# ----------------------------
+# BUILD DATABASE (optimized chunking)
+# ----------------------------
 
 def build_db():
     text = load_pdf(PDF_PATH)
 
     if not text:
-        print("Error: PDF not found or empty")
+        print("PDF missing or empty")
         return
 
     words = text.split()
-    chunks = [" ".join(words[i:i+300]) for i in range(0, len(words), 300)]
 
-    # clear old DB
+    chunk_size = 300
+    overlap = 50
+
+    chunks = []
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = " ".join(words[i:i + chunk_size])
+        chunks.append(chunk)
+
+    # clear old DB safely
     try:
         old = collection.get()
-        if old and old.get("ids"):
+        if old.get("ids"):
             collection.delete(ids=old["ids"])
     except:
         pass
 
-    for i, chunk in enumerate(chunks):
-        emb = embedder.encode(chunk).tolist()
+    # batch embedding (FASTER)
+    embeddings = get_embedder().encode(
+        chunks,
+        normalize_embeddings=True
+    ).tolist()
 
-        collection.add(
-            ids=[str(i)],
-            documents=[chunk],
-            embeddings=[emb]
-        )
+    collection.add(
+        ids=[str(i) for i in range(len(chunks))],
+        documents=chunks,
+        embeddings=embeddings
+    )
 
-    print("Success: Vector DB Ready!")
+    print(f"Vector DB ready ({len(chunks)} chunks)")
 
-# ASK QUESTION (RAG)
-def ask_question(question: str):
 
-    if collection.count() == 0:
-        return "DB not built"
+# ----------------------------
+# RETRIEVAL 
+# ----------------------------
 
-    q_emb = embedder.encode(question).tolist()
+def retrieve_chunks(question: str, n_results: int = 5):
+
+    q_emb = get_embedder().encode(
+        question,
+        normalize_embeddings=True
+    ).tolist()
 
     results = collection.query(
         query_embeddings=[q_emb],
-        n_results=3
+        n_results=min(n_results, collection.count()),
+        include=["documents"]
     )
 
-    docs = results.get("documents", [[]])[0]
+    return results["documents"][0]
+
+
+def retrieve_full_context(n_results=50):
+    """
+    Used only for history/timeline questions
+    """
+    data = collection.get(include=["documents"])
+    return data.get("documents", [])[:n_results]
+
+
+# ----------------------------
+# ASK QUESTION (FIXED + FASTER)
+# ----------------------------
+
+def ask_question(question: str):
+
+    if collection.count() == 0:
+        build_db()
+
+    # choose retrieval strategy
+    if is_history_question(question):
+        docs = retrieve_full_context(80)   # expanded context for history
+    else:
+        docs = retrieve_chunks(question, n_results=5)
 
     if not docs:
-        return "I don't have that information"
+        return "I don't have that information."
 
     context = "\n\n".join(docs)
 
-    prompt = f"""
+    if is_history_question(question):
+        prompt = f"""
 You are a strict RAG assistant.
 
-Use ONLY this context:
+TASK:
+- Explain full history using ONLY the context
+- Provide a clear chronological timeline
+- Do NOT skip events if present in context
+- Do NOT hallucinate missing events
 
+FORMAT:
+1. Short overview
+2. Chronological timeline (bullet points)
+3. Summary of evolution
+
+CONTEXT:
 {context}
 
-Question: {question}
+QUESTION:
+{question}
+"""
+    else:
+        prompt = f"""
+You are a strict assistant.
 
-If answer is not in context, say:
-"I don't have that information"
+RULES:
+- Answer ONLY from context
+- Be concise (2–5 sentences)
+- If not in context say: "I don't have that information."
+
+CONTEXT:
+{context}
+
+QUESTION:
+{question}
 """
 
-    response = model.generate_content(prompt)
-    return response.text
+    try:
+        response = get_vertex_client().models.generate_content(
+            model=VERTEX_AI_MODEL,
+            contents=prompt
+        )
+        return response.text
 
+    except Exception as e:
+        return f"""
+Vertex AI unavailable.
 
-def _is_rag_miss(answer: str) -> bool:
-    text = (answer or "").strip().lower()
-    misses = [
-        "i don't have that information",
-        "db not built",
-        "error:",
-    ]
-    return not text or any(miss in text for miss in misses)
+Error: {str(e)}
 
-
-def ask_normal_agent(question: str, mode: str = "advisor") -> str:
-    mode_instructions = {
-        "advisor": "Give practical, action-focused home energy advice.",
-        "solar": "Explain solar and energy concepts clearly, and say when details are general knowledge.",
-        "billing": "Focus on bills, usage cost, budgeting, and savings advice.",
-    }
-    instruction = mode_instructions.get(mode, mode_instructions["advisor"])
-
-    prompt = f"""
-You are VoltStream's normal AI energy assistant.
-
-{instruction}
-
-Answer the user in a helpful, concise way. If you are not using the PDF knowledge base,
-do not pretend the answer came from a document. Prefer short bullets when useful.
-
-User question: {question}
+--- Context Used ---
+{context}
 """
 
-    response = model.generate_content(prompt)
-    return response.text
 
+# ----------------------------
+# MAIN LOOP (optimized)
+# ----------------------------
 
-def ask_project_assistant(question: str, mode: str = "advisor", project_context: str = "") -> str:
-    mode_instructions = {
-        "advisor": "Give practical, action-focused guidance for the VoltStream energy dashboard project.",
-        "solar": "Explain solar and energy concepts in the context of this VoltStream project.",
-        "billing": "Focus on billing, cost, usage, budget alerts, and savings inside the VoltStream project.",
-    }
-    instruction = mode_instructions.get(mode, mode_instructions["advisor"])
+if __name__ == "__main__":
 
-    prompt = f"""
-You are the VoltStream Project AI Assistant.
+    if collection.count() == 0:
+        build_db()
 
-You help users understand and operate this specific project: dashboard metrics,
-smart devices, analytics, billing, and energy-saving actions.
+    print("\nRAG System Ready 🚀")
 
-{instruction}
+    while True:
 
-Current project data:
-{project_context}
+        question = input("\nAsk a question (or type exit): ")
 
-Answer clearly and practically. If the project data does not include a detail,
-say what is missing and give the best next action inside the app.
+        if question.lower() == "exit":
+            break
 
-User question: {question}
-"""
+        answer = ask_question(question)
 
-    response = model.generate_content(prompt)
-    return response.text
-
-
-def ask_hybrid_assistant(question: str, mode: str = "advisor") -> dict:
-    rag_answer = ask_question(question)
-
-    if not _is_rag_miss(rag_answer):
-        return {
-            "answer": rag_answer,
-            "source": "rag",
-            "label": "RAG knowledge base",
-        }
-
-    normal_answer = ask_normal_agent(question, mode)
-    return {
-        "answer": normal_answer,
-        "source": "agent",
-        "label": "Normal agent",
-    }
+        print("\nAnswer:\n")
+        print(answer)
